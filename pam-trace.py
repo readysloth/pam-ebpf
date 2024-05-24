@@ -59,6 +59,12 @@ PROGRAM = r'''
 #define PAM_REFRESH_CRED 0x0010U
 #define PAM_CHANGE_EXPIRED_AUTHTOK 0x0020U
 
+#ifndef MAX_BUF_SIZE
+#define MAX_BUF_SIZE 2048
+#endif
+
+typedef char heap_t[MAX_BUF_SIZE];
+
 BPF_RINGBUF_OUTPUT(OUTPUT, 8);
 
 typedef enum {
@@ -120,10 +126,15 @@ typedef struct {
         pam_close_session_info_t close_session_info;
         pam_chauthtok_info_t chauthtok_info;
     };
+    int heap_size;
+    heap_t *heap;
 } output_info_t;
 
+BPF_PERCPU_ARRAY(HEAP, heap_t, 1);
+
 static output_info_t create_output_info(info_type_t type){
-    output_info_t output_info = {.type = type};
+    int zero = 0;
+    output_info_t output_info = {};
     generic_info_t info = {};
 
     bpf_get_current_comm(
@@ -131,14 +142,18 @@ static output_info_t create_output_info(info_type_t type){
         sizeof(info.procname)
     );
 
+    output_info.type = type;
+    output_info.heap = HEAP.lookup(&zero);
+    output_info.heap_size = sizeof(heap_t);
+
     info.pid = bpf_get_current_pid_tgid() >> 32;
-    info.flags.silent = "";
-    info.flags.disallow_null_authtok = "";
-    info.flags.establish_cred = "";
-    info.flags.delete_cred = "";
-    info.flags.reinitialize_cred = "";
-    info.flags.refresh_cred = "";
-    info.flags.change_expired_authtok = "";
+    info.flags.silent = false;
+    info.flags.disallow_null_authtok = false;
+    info.flags.establish_cred = false;
+    info.flags.delete_cred = false;
+    info.flags.reinitialize_cred = false;
+    info.flags.refresh_cred = false;
+    info.flags.change_expired_authtok = false;
 
     switch(type){
         case AUTH:
@@ -177,6 +192,30 @@ static pam_flags_t unpack_flags(int flags){
     return pam_flags;
 }
 
+static void parse_pam_argv(output_info_t *info, int argc, const char **argv){
+    if (!info->heap){
+        return;
+    }
+
+    argc = argc > 10 ? 10 : argc;
+
+    int bytes_written = 0;
+    int available_space = info->heap_size;
+    const unsigned int space_per_record = 64;
+    for (int i = 0; i < argc && available_space > 0; i++){
+        int ret = bpf_probe_read_kernel_str(
+            *(info->heap)+bytes_written,
+            space_per_record,
+            argv[i]
+        );
+        if (ret < 0){
+            break;
+        }
+        bytes_written += ret;
+        available_space = info->heap_size - bytes_written;
+    }
+}
+
 int probe_pam_sm_authenticate(
         struct pt_regs *ctx,
         void *pamh,
@@ -185,47 +224,58 @@ int probe_pam_sm_authenticate(
         const char **argv){
     output_info_t info = create_output_info(AUTH);
     info.auth_info.info.flags = unpack_flags(flags);
+    parse_pam_argv(&info, argc, argv);
     OUTPUT.ringbuf_output(&info, sizeof(info), 0);
     return 0;
 }
 
-int probe_pam_sm_setcred(struct pt_regs *ctx){
+int probe_pam_sm_setcred(
+        struct pt_regs *ctx,
+        void *pamh,
+        int flags){
     output_info_t info = create_output_info(SETCRED);
-    info.setcred_info.info.flags = unpack_flags(0);
+    info.setcred_info.info.flags = unpack_flags(flags);
     OUTPUT.ringbuf_output(&info, sizeof(info), 0);
-
     return 0;
 }
 
-int probe_pam_sm_acct_mgmt(struct pt_regs *ctx){
+int probe_pam_sm_acct_mgmt(
+        struct pt_regs *ctx,
+        void *pamh,
+        int flags){
     output_info_t info = create_output_info(ACCT_MGMT);
-    info.acct_mgmt_info.info.flags = unpack_flags(0);
+    info.acct_mgmt_info.info.flags = unpack_flags(flags);
     OUTPUT.ringbuf_output(&info, sizeof(info), 0);
-
     return 0;
 }
 
-int probe_pam_sm_open_session(struct pt_regs *ctx){
+int probe_pam_sm_open_session(
+        struct pt_regs *ctx,
+        void *pamh,
+        int flags){
     output_info_t info = create_output_info(OPEN_SESSION);
-    info.open_session_info.info.flags = unpack_flags(0);
+    info.open_session_info.info.flags = unpack_flags(flags);
     OUTPUT.ringbuf_output(&info, sizeof(info), 0);
-
     return 0;
 }
 
-int probe_pam_sm_close_session(struct pt_regs *ctx){
+int probe_pam_sm_close_session(
+        struct pt_regs *ctx,
+        void *pamh,
+        int flags){
     output_info_t info = create_output_info(CLOSE_SESSION);
-    info.close_session_info.info.flags = unpack_flags(0);
+    info.close_session_info.info.flags = unpack_flags(flags);
     OUTPUT.ringbuf_output(&info, sizeof(info), 0);
-
     return 0;
 }
 
-int probe_pam_sm_chauthtok(struct pt_regs *ctx){
+int probe_pam_sm_chauthtok(
+        struct pt_regs *ctx,
+        void *pamh,
+        int flags){
     output_info_t info = create_output_info(CHAUTHTOK);
-    info.chauthtok_info.info.flags = unpack_flags(0);
+    info.chauthtok_info.info.flags = unpack_flags(flags);
     OUTPUT.ringbuf_output(&info, sizeof(info), 0);
-
     return 0;
 }
 '''
@@ -345,15 +395,21 @@ OPEN_SESSION = (ACCT_MGMT + 1)
 CLOSE_SESSION = (OPEN_SESSION + 1)
 CHAUTHTOK = (CLOSE_SESSION + 1)
 
+MAX_BUF_SIZE = 2048
+
 
 class output_info_t(ctypes.Structure):
     __slots__ = [
         'type',
+        'heap_size',
+        'heap',
     ]
     _anonymous_ = ('u',)
     _fields_ = [
         ('type', ctypes.c_int),
         ('u', output_info_UNION),
+        ('heap_size', ctypes.c_int),
+        ('heap', ctypes.c_char * MAX_BUF_SIZE),
     ]
 
 
@@ -366,7 +422,7 @@ UPROBED_FUNCTONS = {
     CHAUTHTOK: 'chauthtok'
 }
 
-bpf = BPF(text=PROGRAM)
+bpf = BPF(text=PROGRAM, cflags=[f'-DMAX_BUF_SIZE={MAX_BUF_SIZE}'])
 
 
 def attach(bpf, library, pid=-1):
@@ -390,7 +446,8 @@ def generic_info(generic_info: generic_info_t):
 
 
 def auth_info(auth_info: pam_auth_info_t):
-    return generic_info(auth_info.info)
+    generic_info_list = generic_info(auth_info.info)
+    return generic_info_list
 
 
 def setcred_info(setcred_info: pam_setcred_info_t):
@@ -430,10 +487,10 @@ def print_event(cpu, data, size):
         info_list = chauthtok_info(info.chauthtok_info)
 
     info_func = f'pam_sm_{UPROBED_FUNCTONS[info.type]}:'
-    print(' '.join([info_func] + info_list), file=sys.stderr)
+    print(' '.join([info_func] + info_list + [repr(info.heap)]), file=sys.stderr)
 
 
-attach(bpf, '/lib64/security/pam_unix.so')
+attach(bpf, '/lib64/security/pam_env.so')
 bpf['OUTPUT'].open_ring_buffer(print_event)
 
 while 1:
