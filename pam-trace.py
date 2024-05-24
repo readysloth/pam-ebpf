@@ -2,6 +2,9 @@
 
 import sys
 import ctypes
+import argparse
+
+from pathlib import Path
 
 from bcc import BPF
 
@@ -395,7 +398,31 @@ OPEN_SESSION = (ACCT_MGMT + 1)
 CLOSE_SESSION = (OPEN_SESSION + 1)
 CHAUTHTOK = (CLOSE_SESSION + 1)
 
-MAX_BUF_SIZE = 2048
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    '-S', '--max-buffer-size',
+    default=2048,
+    type=int,
+    help='change buffer for data capture (default 2048 bytes)'
+)
+parser.add_argument(
+    '-d', '--pam-dir',
+    default='/lib64/security/',
+    type=Path,
+    help='PAM-modules folder (default /lib64/security/)'
+)
+parser.add_argument(
+    '-g', '--glob',
+    default='pam_*.so',
+    type=str,
+    help='Glob for attaching subset of PAM-modules (default pam_*.so)'
+)
+
+args = parser.parse_args()
+MAX_BUF_SIZE = args.max_buffer_size
+
+COMPILED_BPF = BPF(text=PROGRAM, cflags=[f'-DMAX_BUF_SIZE={MAX_BUF_SIZE}'])
 
 
 class output_info_t(ctypes.Structure):
@@ -422,27 +449,26 @@ UPROBED_FUNCTONS = {
     CHAUTHTOK: 'chauthtok'
 }
 
-bpf = BPF(text=PROGRAM, cflags=[f'-DMAX_BUF_SIZE={MAX_BUF_SIZE}'])
-
 
 def attach(bpf, library, pid=-1):
     for func in UPROBED_FUNCTONS.values():
-        bpf.attach_uprobe(name=library,
-                          sym=f'pam_sm_{func}',
-                          fn_name=f'probe_pam_sm_{func}',
-                          pid=pid)
+        try:
+            bpf.attach_uprobe(name=library,
+                              sym=f'pam_sm_{func}',
+                              fn_name=f'probe_pam_sm_{func}',
+                              pid=pid)
+        except Exception:
+            continue
 
 
 def generic_info(generic_info: generic_info_t):
-    info_list = [str(generic_info.pid), generic_info.procname.decode()]
+    proc_info = f'{generic_info.procname.decode()}({generic_info.pid})'
     flags_info = []
     for field in pam_flags_t.__slots__:
         flag = getattr(generic_info.flags, field)
         if flag:
             flags_info.append(f'+{field}')
-        else:
-            flags_info.append(f'-{field}')
-    return info_list + [f"[{' '.join(flags_info)}]"]
+    return [proc_info, f"[{' '.join(flags_info)}]"]
 
 
 def auth_info(auth_info: pam_auth_info_t):
@@ -490,11 +516,13 @@ def print_event(cpu, data, size):
     print(' '.join([info_func] + info_list + [repr(info.heap)]), file=sys.stderr)
 
 
-attach(bpf, '/lib64/security/pam_env.so')
-bpf['OUTPUT'].open_ring_buffer(print_event)
+for module in args.pam_dir.glob(args.glob):
+    attach(COMPILED_BPF, str(module))
+
+COMPILED_BPF['OUTPUT'].open_ring_buffer(print_event)
 
 while 1:
     try:
-        bpf.ring_buffer_poll()
+        COMPILED_BPF.ring_buffer_poll()
     except KeyboardInterrupt:
         exit()
