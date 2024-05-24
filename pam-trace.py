@@ -357,20 +357,20 @@ class output_info_t(ctypes.Structure):
     ]
 
 
-UPROBED_FUNCTONS = [
-    'authenticate',
-    'setcred',
-    'acct_mgmt',
-    'open_session',
-    'close_session',
-    'chauthtok'
-]
+UPROBED_FUNCTONS = {
+    AUTH: 'authenticate',
+    SETCRED: 'setcred',
+    ACCT_MGMT: 'acct_mgmt',
+    OPEN_SESSION: 'open_session',
+    CLOSE_SESSION: 'close_session',
+    CHAUTHTOK: 'chauthtok'
+}
 
 bpf = BPF(text=PROGRAM)
 
 
 def attach(bpf, library, pid=-1):
-    for func in UPROBED_FUNCTONS:
+    for func in UPROBED_FUNCTONS.values():
         bpf.attach_uprobe(name=library,
                           sym=f'pam_sm_{func}',
                           fn_name=f'probe_pam_sm_{func}',
@@ -386,31 +386,31 @@ def generic_info(generic_info: generic_info_t):
             flags_info.append(f'+{field}')
         else:
             flags_info.append(f'-{field}')
-    return info_list + [f" [{' '.join(flags_info)}]"]
+    return info_list + [f"[{' '.join(flags_info)}]"]
 
 
 def auth_info(auth_info: pam_auth_info_t):
-    return ['pam_sm_authenticate:'] + generic_info(auth_info.info)
+    return generic_info(auth_info.info)
 
 
 def setcred_info(setcred_info: pam_setcred_info_t):
-    return ['pam_sm_setcred:'] + generic_info(setcred_info.info)
+    return generic_info(setcred_info.info)
 
 
 def acct_mgmt_info(acct_mgmt_info: pam_acct_mgmt_info_t):
-    return ['pam_sm_acct_mgmt:'] + generic_info(acct_mgmt_info.info)
+    return generic_info(acct_mgmt_info.info)
 
 
 def open_session_info(open_session_info: pam_open_session_info_t):
-    return ['pam_sm_open_session:'] + generic_info(open_session_info.info)
+    return generic_info(open_session_info.info)
 
 
 def close_session_info(close_session_info: pam_close_session_info_t):
-    return ['pam_sm_close_session:'] + generic_info(close_session_info.info)
+    return generic_info(close_session_info.info)
 
 
 def chauthtok_info(chauthtok_info: pam_chauthtok_info_t):
-    return ['pam_sm_chauthtok:'] + generic_info(chauthtok_info.info)
+    return generic_info(chauthtok_info.info)
 
 
 def print_event(cpu, data, size):
@@ -429,7 +429,8 @@ def print_event(cpu, data, size):
     elif info.type == CHAUTHTOK:
         info_list = chauthtok_info(info.chauthtok_info)
 
-    print(' '.join(info_list), file=sys.stderr)
+    info_func = f'pam_sm_{UPROBED_FUNCTONS[info.type]}:'
+    print(' '.join([info_func] + info_list), file=sys.stderr)
 
 
 attach(bpf, '/lib64/security/pam_unix.so')
