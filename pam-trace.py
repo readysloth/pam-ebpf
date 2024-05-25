@@ -225,7 +225,7 @@ static void write_str_to_heap(output_info_t *info, const char *data) {
      * This makes verifier happier than
      * info->heap_taken >= info->heap_size - space_per_record
      */
-    if (info->heap_taken >= MAX_BUF_SIZE - space_per_record){
+    if (info->heap_taken > MAX_BUF_SIZE - space_per_record){
         return;
     }
     int ret = bpf_probe_read_user_str(
@@ -242,7 +242,7 @@ static void write_str_to_heap(output_info_t *info, const char *data) {
 static void convert_heap_delimiters(output_info_t *info){
     const unsigned int border = MAX_BUF_SIZE;
     for (unsigned int i = 0; i < MAX_BUF_SIZE; i++){
-        if (info->heap[i] == '\0' && i < info->heap_taken){
+        if (info->heap[i] == '\0' && i < info->heap_taken - 1){
             info->heap[i] = ' ';
         }
     }
