@@ -86,14 +86,22 @@ typedef struct pam_handle {
 #define MAX_BUF_SIZE (unsigned int)2048
 #endif
 
+typedef char small_str[16];
 typedef char heap_buffer_t[MAX_BUF_SIZE];
 
 typedef struct {
     heap_buffer_t buffer;
-    unsigned int heap_taken;
+    size_t taken;
 } heap_t;
 
-#define HEAP_SIZE(HEAP) (sizeof(heap_buffer_t))
+
+#define SMALL_STR_SIZE \
+    sizeof(small_str)
+
+#define HEAP_SIZE \
+    (sizeof(((heap_t*)NULL)->buffer))
+#define FREE_HEAP_SIZE(HEAP) \
+    (HEAP_SIZE - (HEAP)->taken)
 
 BPF_RINGBUF_OUTPUT(OUTPUT, 8);
 
@@ -175,7 +183,7 @@ static output_info_t* create_output_info(info_type_t type){
     );
 
     output_info->type = type;
-    output_info->heap.heap_taken = 0;
+    output_info->heap.taken = 0;
 
     info.pid = bpf_get_current_pid_tgid() >> 32;
     info.flags.silent = false;
@@ -223,30 +231,38 @@ static pam_flags_t unpack_flags(int flags){
     return pam_flags;
 }
 
-static void write_str_to_heap(heap_t *heap, const char *data) {
-    const unsigned int space_per_record = 64;
-    /*
-     * This makes verifier happier than
-     * heap->heap_taken >= heap->heap_size - space_per_record
-     */
-    if (heap->heap_taken > HEAP_SIZE(heap->buffer) - space_per_record){
+static void write_small_str_to_heap(heap_t *heap, small_str str) {
+    if (heap->taken > HEAP_SIZE - SMALL_STR_SIZE){
         return;
     }
+    strncpy(&heap->buffer[heap->taken], str, SMALL_STR_SIZE);
+    heap->taken += strlen(str) + 1;
+}
+
+static void write_str_to_heap(
+        heap_t *heap,
+        const char *str) {
+    const unsigned int space_per_record = 64;
+    if (heap->taken > HEAP_SIZE - space_per_record){
+        return;
+    }
+
     int ret = bpf_probe_read_user_str(
-        heap->buffer + heap->heap_taken,
+        &heap->buffer[heap->taken],
         space_per_record,
-        data
+        str
     );
     if (ret < 0){
+        write_small_str_to_heap(heap, "%READ_ERROR%");
         return;
     }
-    heap->heap_taken += ret;
+    heap->taken += ret;
 }
 
 static void convert_heap_delimiters(heap_t *heap){
     const unsigned int border = MAX_BUF_SIZE;
     for (unsigned int i = 0; i < MAX_BUF_SIZE; i++){
-        if (heap->buffer[i] == '\0' && i < heap->heap_taken - 1){
+        if (heap->buffer[i] == '\0' && i < heap->taken - 1){
             heap->buffer[i] = ' ';
         }
     }
@@ -258,25 +274,36 @@ static void parse_pam_argv(
         const char **argv){
     argc = argc > 10 ? 10 : argc;
 
-    int available_space = HEAP_SIZE(heap->buffer);
+    int available_space = HEAP_SIZE;
+    write_small_str_to_heap(heap, "Module ARGV:");
     for (int i = 0; i < argc && available_space > 0; i++){
         write_str_to_heap(heap, argv[i]);
-        available_space = HEAP_SIZE(heap->buffer) - heap->heap_taken;
+        available_space = HEAP_SIZE - heap->taken;
     }
 }
 
 static void parse_pam_handle(
         heap_t *heap,
         pam_handle_t *pamh){
+    write_small_str_to_heap(heap, "authtok:");
     write_str_to_heap(heap, pamh->authtok);
+    write_small_str_to_heap(heap, "oldauthtok:");
     write_str_to_heap(heap, pamh->oldauthtok);
+    write_small_str_to_heap(heap, "prompt:");
     write_str_to_heap(heap, pamh->prompt);
+    write_small_str_to_heap(heap, "service_name:");
     write_str_to_heap(heap, pamh->service_name);
+    write_small_str_to_heap(heap, "user:");
     write_str_to_heap(heap, pamh->user);
+    write_small_str_to_heap(heap, "rhost:");
     write_str_to_heap(heap, pamh->rhost);
+    write_small_str_to_heap(heap, "ruser:");
     write_str_to_heap(heap, pamh->ruser);
+    write_small_str_to_heap(heap, "tty:");
     write_str_to_heap(heap, pamh->tty);
+    write_small_str_to_heap(heap, "xdisplay:");
     write_str_to_heap(heap, pamh->xdisplay);
+    write_small_str_to_heap(heap, "authtok_type:");
     write_str_to_heap(heap, pamh->authtok_type);
 }
 
@@ -535,11 +562,11 @@ COMPILED_BPF = BPF(text=PROGRAM, cflags=[f'-DMAX_BUF_SIZE=(unsigned int){MAX_BUF
 class heap_t(ctypes.Structure):
     __slots__ = [
         'buffer',
-        'heap_taken',
+        'taken',
     ]
     _fields_ = [
         ('buffer', ctypes.c_char * MAX_BUF_SIZE),
-        ('heap_taken', ctypes.c_uint),
+        ('taken', ctypes.c_size_t),
     ]
 
 
@@ -630,8 +657,8 @@ def print_event(cpu, data, size):
 
     info_func = f'pam_sm_{UPROBED_FUNCTONS[info.type]}:'
     heap_info = ''
-    if info.heap.heap_taken:
-        heap_info = repr(info.heap.buffer)
+    if info.heap.taken:
+        heap_info = info.heap.buffer.decode()
     print(' '.join([info_func] + info_list + [heap_info]), file=sys.stderr)
 
 
@@ -640,6 +667,7 @@ for module in args.pam_dir.glob(args.glob):
 
 COMPILED_BPF['OUTPUT'].open_ring_buffer(print_event)
 
+print('Ready')
 while 1:
     try:
         COMPILED_BPF.ring_buffer_poll()
