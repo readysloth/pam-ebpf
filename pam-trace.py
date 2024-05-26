@@ -86,7 +86,14 @@ typedef struct pam_handle {
 #define MAX_BUF_SIZE (unsigned int)2048
 #endif
 
-typedef char heap_t[MAX_BUF_SIZE];
+typedef char heap_buffer_t[MAX_BUF_SIZE];
+
+typedef struct {
+    heap_buffer_t buffer;
+    unsigned int heap_taken;
+} heap_t;
+
+#define HEAP_SIZE(HEAP) (sizeof(heap_buffer_t))
 
 BPF_RINGBUF_OUTPUT(OUTPUT, 8);
 
@@ -149,8 +156,6 @@ typedef struct {
         pam_close_session_info_t close_session_info;
         pam_chauthtok_info_t chauthtok_info;
     };
-    unsigned int heap_size;
-    unsigned int heap_taken;
     heap_t heap;
 } output_info_t;
 
@@ -170,8 +175,7 @@ static output_info_t* create_output_info(info_type_t type){
     );
 
     output_info->type = type;
-    output_info->heap_size = sizeof(heap_t);
-    output_info->heap_taken = 0;
+    output_info->heap.heap_taken = 0;
 
     info.pid = bpf_get_current_pid_tgid() >> 32;
     info.flags.silent = false;
@@ -219,61 +223,61 @@ static pam_flags_t unpack_flags(int flags){
     return pam_flags;
 }
 
-static void write_str_to_heap(output_info_t *info, const char *data) {
+static void write_str_to_heap(heap_t *heap, const char *data) {
     const unsigned int space_per_record = 64;
     /*
      * This makes verifier happier than
-     * info->heap_taken >= info->heap_size - space_per_record
+     * heap->heap_taken >= heap->heap_size - space_per_record
      */
-    if (info->heap_taken > MAX_BUF_SIZE - space_per_record){
+    if (heap->heap_taken > HEAP_SIZE(heap->buffer) - space_per_record){
         return;
     }
     int ret = bpf_probe_read_user_str(
-        info->heap + info->heap_taken,
+        heap->buffer + heap->heap_taken,
         space_per_record,
         data
     );
     if (ret < 0){
         return;
     }
-    info->heap_taken += ret;
+    heap->heap_taken += ret;
 }
 
-static void convert_heap_delimiters(output_info_t *info){
+static void convert_heap_delimiters(heap_t *heap){
     const unsigned int border = MAX_BUF_SIZE;
     for (unsigned int i = 0; i < MAX_BUF_SIZE; i++){
-        if (info->heap[i] == '\0' && i < info->heap_taken - 1){
-            info->heap[i] = ' ';
+        if (heap->buffer[i] == '\0' && i < heap->heap_taken - 1){
+            heap->buffer[i] = ' ';
         }
     }
 }
 
 static void parse_pam_argv(
-        output_info_t *info,
+        heap_t *heap,
         int argc,
         const char **argv){
     argc = argc > 10 ? 10 : argc;
 
-    int available_space = info->heap_size;
+    int available_space = HEAP_SIZE(heap->buffer);
     for (int i = 0; i < argc && available_space > 0; i++){
-        write_str_to_heap(info, argv[i]);
-        available_space = info->heap_size - info->heap_taken;
+        write_str_to_heap(heap, argv[i]);
+        available_space = HEAP_SIZE(heap->buffer) - heap->heap_taken;
     }
 }
 
 static void parse_pam_handle(
-        output_info_t *info,
+        heap_t *heap,
         pam_handle_t *pamh){
-    write_str_to_heap(info, pamh->authtok);
-    write_str_to_heap(info, pamh->oldauthtok);
-    write_str_to_heap(info, pamh->prompt);
-    write_str_to_heap(info, pamh->service_name);
-    write_str_to_heap(info, pamh->user);
-    write_str_to_heap(info, pamh->rhost);
-    write_str_to_heap(info, pamh->ruser);
-    write_str_to_heap(info, pamh->tty);
-    write_str_to_heap(info, pamh->xdisplay);
-    write_str_to_heap(info, pamh->authtok_type);
+    write_str_to_heap(heap, pamh->authtok);
+    write_str_to_heap(heap, pamh->oldauthtok);
+    write_str_to_heap(heap, pamh->prompt);
+    write_str_to_heap(heap, pamh->service_name);
+    write_str_to_heap(heap, pamh->user);
+    write_str_to_heap(heap, pamh->rhost);
+    write_str_to_heap(heap, pamh->ruser);
+    write_str_to_heap(heap, pamh->tty);
+    write_str_to_heap(heap, pamh->xdisplay);
+    write_str_to_heap(heap, pamh->authtok_type);
 }
 
 
@@ -288,9 +292,9 @@ int probe_pam_sm_authenticate(
         return 0;
     }
     info->auth_info.info.flags = unpack_flags(flags);
-    parse_pam_argv(info, argc, argv);
-    parse_pam_handle(info, pamh);
-    convert_heap_delimiters(info);
+    parse_pam_argv(&info->heap, argc, argv);
+    parse_pam_handle(&info->heap, pamh);
+    convert_heap_delimiters(&info->heap);
     OUTPUT.ringbuf_output(info, sizeof(output_info_t), 0);
     return 0;
 }
@@ -306,7 +310,9 @@ int probe_pam_sm_setcred(
         return 0;
     }
     info->setcred_info.info.flags = unpack_flags(flags);
-    parse_pam_handle(info, pamh);
+    parse_pam_argv(&info->heap, argc, argv);
+    parse_pam_handle(&info->heap, pamh);
+    convert_heap_delimiters(&info->heap);
     OUTPUT.ringbuf_output(info, sizeof(output_info_t), 0);
     return 0;
 }
@@ -322,8 +328,9 @@ int probe_pam_sm_acct_mgmt(
         return 0;
     }
     info->acct_mgmt_info.info.flags = unpack_flags(flags);
-    parse_pam_argv(info, argc, argv);
-    parse_pam_handle(info, pamh);
+    parse_pam_argv(&info->heap, argc, argv);
+    parse_pam_handle(&info->heap, pamh);
+    convert_heap_delimiters(&info->heap);
     OUTPUT.ringbuf_output(info, sizeof(output_info_t), 0);
     return 0;
 }
@@ -339,8 +346,9 @@ int probe_pam_sm_open_session(
         return 0;
     }
     info->open_session_info.info.flags = unpack_flags(flags);
-    parse_pam_argv(info, argc, argv);
-    parse_pam_handle(info, pamh);
+    parse_pam_argv(&info->heap, argc, argv);
+    parse_pam_handle(&info->heap, pamh);
+    convert_heap_delimiters(&info->heap);
     OUTPUT.ringbuf_output(info, sizeof(output_info_t), 0);
     return 0;
 }
@@ -356,8 +364,9 @@ int probe_pam_sm_close_session(
         return 0;
     }
     info->close_session_info.info.flags = unpack_flags(flags);
-    parse_pam_argv(info, argc, argv);
-    parse_pam_handle(info, pamh);
+    parse_pam_argv(&info->heap, argc, argv);
+    parse_pam_handle(&info->heap, pamh);
+    convert_heap_delimiters(&info->heap);
     OUTPUT.ringbuf_output(info, sizeof(output_info_t), 0);
     return 0;
 }
@@ -373,8 +382,9 @@ int probe_pam_sm_chauthtok(
         return 0;
     }
     info->chauthtok_info.info.flags = unpack_flags(flags);
-    parse_pam_argv(info, argc, argv);
-    parse_pam_handle(info, pamh);
+    parse_pam_argv(&info->heap, argc, argv);
+    parse_pam_handle(&info->heap, pamh);
+    convert_heap_delimiters(&info->heap);
     OUTPUT.ringbuf_output(info, sizeof(output_info_t), 0);
     return 0;
 }
@@ -522,20 +532,27 @@ MAX_BUF_SIZE = args.max_buffer_size
 COMPILED_BPF = BPF(text=PROGRAM, cflags=[f'-DMAX_BUF_SIZE=(unsigned int){MAX_BUF_SIZE}'])
 
 
+class heap_t(ctypes.Structure):
+    __slots__ = [
+        'buffer',
+        'heap_taken',
+    ]
+    _fields_ = [
+        ('buffer', ctypes.c_char * MAX_BUF_SIZE),
+        ('heap_taken', ctypes.c_uint),
+    ]
+
+
 class output_info_t(ctypes.Structure):
     __slots__ = [
         'type',
-        'heap_size',
-        'heap_taken',
         'heap',
     ]
     _anonymous_ = ('u',)
     _fields_ = [
         ('type', ctypes.c_int),
         ('u', output_info_UNION),
-        ('heap_size', ctypes.c_uint),
-        ('heap_taken', ctypes.c_uint),
-        ('heap', ctypes.c_char * MAX_BUF_SIZE),
+        ('heap', heap_t),
     ]
 
 
@@ -613,8 +630,8 @@ def print_event(cpu, data, size):
 
     info_func = f'pam_sm_{UPROBED_FUNCTONS[info.type]}:'
     heap_info = ''
-    if info.heap_taken:
-        heap_info = repr(info.heap)
+    if info.heap.heap_taken:
+        heap_info = repr(info.heap.buffer)
     print(' '.join([info_func] + info_list + [heap_info]), file=sys.stderr)
 
 
